@@ -44,17 +44,6 @@ python src/mlndt_dinov2_cad.py
 We recommend a separate virtual environment for each folder, because
 the two pipelines use different deep learning frameworks.
 
-## Authors
-
-Ahmed Hamdi<sup>a,b,†</sup>, Flora Estermann<sup>a,b,†</sup>, Valerie Kaftandjian<sup>b,*</sup>,
-Philippe Delachartre<sup>a</sup>, Philippe Guy<sup>b</sup>
-
-<sup>a</sup> Univ. Lyon, INSA-Lyon, CNRS, Inserm, CREATIS UMR 5220, U1294, Villeurbanne, F-69621, France
-<sup>b</sup> Univ. Lyon, INSA-Lyon, LVA, Villeurbanne, F-69621, France
-
-<sup>†</sup> These authors contributed equally to this work.
-<sup>*</sup> Corresponding author.
-
 ## License
 
 See [`LICENSE`](LICENSE).
