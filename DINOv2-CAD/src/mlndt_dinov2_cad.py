@@ -1,16 +1,16 @@
 """
-ML-NDT Ultrasonic B-scan Welds - DINOv2 + Memory Bank + CAD
+ML-NDT Ultrasonic B-scan Welds — DINOv2 + Memory Bank + CAD
 ------------------------------------------------------------------------
 Pipeline:
   256x256 uint16 B-scan images (phased-array ultrasonic data)
   -> normalize to [0,1] -> replicate to RGB
-  -> frozen DINOv2-small (ViT-S/14, 768D features, pre-cached)
+  -> Frozen DINOv2-small (ViT-S/14, 768D features, pre-cached)
   -> VAE decoder (256x256 reconstruction)
   -> p95 pixel residual per image
-  -> memory bank KNN score per image
-  -> ensemble non-conformity score -> CAD p-value -> anomaly label
+  -> Memory bank KNN score per image
+  -> Ensemble NCS -> CAD conformal p-value -> anomaly label
 
-Expected data layout (see data/README.md):
+Expected data layout (see data/README.md for how to obtain the dataset):
   data/ML-NDT/data/training/*.bins, *.labels
   data/ML-NDT/data/validation/*.bins, *.labels
 
@@ -36,13 +36,14 @@ from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, roc_curve
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 SEED       = 42
-# repo_root/src/<this file> -> one level up is the repo root
+# This script lives at <repo_root>/src/<this file>, so climbing one level
+# up gives the repo root and keeps every path relative to the repo.
 REPO_ROOT  = Path(__file__).resolve().parent.parent
 DATA_DIR   = REPO_ROOT / 'data' / 'ML-NDT' / 'data'
 TRAIN_DIR  = DATA_DIR / 'training'
 VAL_DIR    = DATA_DIR / 'validation'
-OUT_DIR    = REPO_ROOT / 'results' / 'mlndt'
-OUT_DIR.mkdir(parents=True, exist_ok=True)
+OUT_DIR    = REPO_ROOT / 'results'
+OUT_DIR.mkdir(exist_ok=True)
 
 IMG_SZ     = 256          # B-scan size
 
@@ -485,7 +486,7 @@ y_pred_cad = (p_values < best_alpha).astype(int)
 y_pred_002 = (p_values < 0.02).astype(int)
 
 # ── Save scores for post-hoc conformal experiments ───────────────────────────
-_save = OUT_DIR / 'mlndt_valsplit.npz'
+_save = Path(__file__).parent / 'results' / 'mlndt_valsplit.npz'
 np.savez(_save, ncs_calib=ncs_calib, ncs_test=ncs_test,
          p_values=p_values, y_test=y_test,
          n_cal=np.int64(n_cal), best_alpha=np.float64(best_alpha),
@@ -576,7 +577,7 @@ ax.set_xticks(x); ax.set_xticklabels(methods, fontsize=9)
 ax.set_ylim(0, 1.15); ax.set_title('Performance vs Thesis Baseline'); ax.legend()
 
 plt.tight_layout()
-out = OUT_DIR / 'results_mlndt_dinov2_valsplit.png'
+out = Path(__file__).parent / 'results' / 'results_mlndt_dinov2_valsplit.png'
 plt.savefig(out, dpi=150, bbox_inches='tight')
 print(f'\nPlot saved → {out}')
 plt.close(fig)
@@ -652,7 +653,7 @@ for col, (idx, hmap) in enumerate(zip(anom_idx, anom_hmaps)):
 cb_ax = fig_e.add_axes([0.92, 0.07, 0.015, 0.45])
 plt.colorbar(im, cax=cb_ax, label='KNN distance (anomaly score)')
 fig_e.suptitle('DINOv2 Memory Bank Explainability — ML-NDT', fontsize=13, fontweight='bold')
-out_exp = OUT_DIR / 'results_mlndt_dinov2_valsplit_explainability.png'
+out_exp = Path(__file__).parent / 'results' / 'results_mlndt_dinov2_valsplit_explainability.png'
 plt.savefig(out_exp, dpi=150, bbox_inches='tight')
 plt.close(fig_e)
 print(f'  Explainability plot → {out_exp}')

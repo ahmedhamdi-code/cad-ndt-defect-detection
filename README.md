@@ -16,7 +16,7 @@ The repository has two independent folders, one for each pipeline:
 | Folder | Pipeline | Datasets | Framework |
 |---|---|---|---|
 | [`VAE-CAD/`](VAE-CAD/) | VAE trained on the images, CAD with Wasserstein-1 distance between residual histograms | Airbus | TensorFlow |
-| [`DINOv2-CAD/`](DINOv2-CAD/) | Frozen DINOv2 features + patch memory bank + small reconstruction head, CAD on the fused score | CT-Casting, NRSD-MN, ML-NDT, Airbus | PyTorch |
+| [`DINOv2-CAD/`](DINOv2-CAD/) | Frozen DINOv2 features + patch memory bank + small reconstruction head, CAD on the fused score | ML-NDT | PyTorch |
 
 Each folder has its own `README.md`, `requirements.txt` and data
 instructions, and can be installed and run on its own. No dataset is
@@ -35,7 +35,7 @@ pip install -r requirements.txt
 python prepare_data.py
 python run_experiments.py
 
-# DINOv2 + CAD (one script per dataset)
+# DINOv2 + CAD (ML-NDT)
 cd ../DINOv2-CAD
 pip install -r requirements.txt
 python src/mlndt_dinov2_cad.py
