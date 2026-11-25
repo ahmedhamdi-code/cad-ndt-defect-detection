@@ -1,20 +1,21 @@
 """
-ML-NDT Ultrasonic B-scan Welds — DINOv2 + Memory Bank + CAD
+CT-Casting - DINOv2 + Memory Bank + CAD
 ------------------------------------------------------------------------
 Pipeline:
-  256x256 uint16 B-scan images (phased-array ultrasonic data)
-  -> normalize to [0,1] -> replicate to RGB
-  -> Frozen DINOv2-small (ViT-S/14, 768D features, pre-cached)
-  -> VAE decoder (256x256 reconstruction)
+  64x64 uint8 grayscale CT patches of aluminium-alloy castings
+  -> normalize /255 -> replicate to RGB for DINOv2
+  -> frozen DINOv2-small (ViT-S/14, 768D features, pre-cached)
+  -> VAE decoder (64x64 reconstruction)
   -> p95 pixel residual per image
-  -> Memory bank KNN score per image
-  -> Ensemble NCS -> CAD conformal p-value -> anomaly label
+  -> memory bank KNN score per image
+  -> ensemble non-conformity score -> CAD p-value -> anomaly label
 
-Expected data layout (see data/README.md for how to obtain the dataset):
-  data/ML-NDT/data/training/*.bins, *.labels
-  data/ML-NDT/data/validation/*.bins, *.labels
+Expected data layout (see data/README.md):
+  data/casting_uniform/uniform_data/false_alarm/ -> normal train
+  data/casting_uniform/uniform_test/false_alarm/ -> normal test
+  data/casting_uniform/uniform_test/true_alarm/  -> defective test
 
-Run: python3 src/mlndt_dinov2_cad.py
+Run: python3 src/casting_dinov2_cad.py
 """
 
 import random
@@ -23,8 +24,6 @@ import matplotlib; matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm import tqdm
-from os import listdir
-from os.path import isfile, join
 
 import torch
 import torch.nn as nn
@@ -35,36 +34,34 @@ from PIL import Image
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, roc_curve
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-SEED       = 42
-# This script lives at <repo_root>/src/<this file>, so climbing one level
-# up gives the repo root and keeps every path relative to the repo.
-REPO_ROOT  = Path(__file__).resolve().parent.parent
-DATA_DIR   = REPO_ROOT / 'data' / 'ML-NDT' / 'data'
-TRAIN_DIR  = DATA_DIR / 'training'
-VAL_DIR    = DATA_DIR / 'validation'
-OUT_DIR    = REPO_ROOT / 'results'
-OUT_DIR.mkdir(exist_ok=True)
+SEED        = 42
+# repo_root/src/<this file> -> one level up is the repo root
+REPO_ROOT   = Path(__file__).resolve().parent.parent
+DATA_DIR    = REPO_ROOT / 'data' / 'casting_uniform'
+TRAIN_DIR   = DATA_DIR / 'uniform_data'
+TEST_DIR    = DATA_DIR / 'uniform_test'
+OUT_DIR     = REPO_ROOT / 'results' / 'casting'
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-IMG_SZ     = 256          # B-scan size
+IMG_SZ      = 64
 
 # VAE
-VAE_EPOCHS = 20
-VAE_LR     = 5e-4
-VAE_BATCH  = 32
-LATENT_DIM = 384
-SSIM_W     = 0.7
-KL_BETA    = 0.5
+VAE_EPOCHS  = 60
+VAE_LR      = 5e-4
+VAE_BATCH   = 32
+LATENT_DIM  = 256
+SSIM_W      = 0.7
+KL_BETA     = 0.5
 
 # CAD
-CAL_SPLIT  = 0.1
-CAD_ALPHA  = 0.02
+CAL_SPLIT   = 0.1
+CAD_ALPHA   = 0.02
 
 # Memory bank
 MAX_BANK_PRETOKENS = 40000
 MAX_BANK_SIZE      = 8000
 K_NEIGHBORS        = 3
-
-ENSEMBLE_W = 0.9
+ENSEMBLE_W         = 0.9
 
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -76,77 +73,56 @@ if DEVICE == 'cuda':
 # 1. DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
 
-def load_bins(directory):
-    """
-    Load all .bins files in directory.
-    Each file: (100, 256, 256) uint16 B-scans.
-    Returns:
-        images : (N, 256, 256) float32 normalised to [0, 1]
-        labels : (N,) int32  0=normal  1=anomal
-    """
-    directory = Path(directory)
-    bin_files = sorted([f for f in listdir(directory)
-                        if isfile(join(directory, f)) and f.endswith('.bins')])
-    all_imgs, all_labels = [], []
-    for fname in tqdm(bin_files, desc=f'  loading {directory.name}', leave=False):
-        raw = np.fromfile(directory / fname, dtype=np.uint16).astype(np.float32)
-        imgs = raw.reshape(-1, IMG_SZ, IMG_SZ)       # (100, 256, 256)
+def load_folder(folder):
+    """Load all .tif images from folder → (N, 64, 64) float32 [0,1]."""
+    paths = sorted(folder.glob('*.tif'))
+    imgs  = []
+    for p in paths:
+        img = Image.open(p).convert('L').resize((IMG_SZ, IMG_SZ), Image.BILINEAR)
+        arr = np.array(img, dtype=np.float32)
+        imgs.append(arr / 255.0)
+    return np.stack(imgs)
 
-        # Per-image normalisation to [0, 1]
-        mn = imgs.min(axis=(1, 2), keepdims=True)
-        mx = imgs.max(axis=(1, 2), keepdims=True)
-        imgs = (imgs - mn) / (mx - mn + 1e-9)
+print('\n── Step 1: Loading CT-Casting data (false_alarm=normal, true_alarm=anomal) ──')
+X_normal_all = load_folder(TRAIN_DIR / 'false_alarm')   # NORMAL train
+X_test_norm  = load_folder(TEST_DIR  / 'false_alarm')   # NORMAL test
+X_test_anom  = load_folder(TEST_DIR  / 'true_alarm')    # ANOMAL test
+# NEW: previously-unused defective pool sitting in the training directory,
+# confirmed disjoint from the test set (zero filename overlap). Used ONLY to
+# build a validation set for w/alpha selection -- test set stays untouched.
+X_val_defect_pool = load_folder(TRAIN_DIR / 'true_alarm')
 
-        label_file = directory / fname.replace('.bins', '.labels')
-        lab = np.loadtxt(label_file)
-        if lab.ndim == 1:           # single row edge case
-            lab = lab.reshape(1, -1)
-        labels = lab[:, 0].astype(np.int32)
-
-        all_imgs.append(imgs)
-        all_labels.append(labels)
-
-    return np.concatenate(all_imgs), np.concatenate(all_labels)
-
-
-print('\n── Step 1: Loading ML-NDT data ──')
-X_train_all, y_train_all = load_bins(TRAIN_DIR)
-X_test,      y_test      = load_bins(VAL_DIR)
-
-X_normal = X_train_all[y_train_all == 0]
-# NEW: defective-labeled training B-scans -- previously discarded entirely
-# (only normal training B-scans were ever used). Disjoint from the test set.
-# Used ONLY to build a validation set for w/alpha selection -- test set
-# stays untouched.
-X_val_defect_pool = X_train_all[y_train_all == 1]
-print(f'Train total: {len(X_train_all)}  normal: {len(X_normal)}  anomal: {(y_train_all==1).sum()}')
-print(f'Test  total: {len(X_test)}       normal: {(y_test==0).sum()}  anomal: {(y_test==1).sum()}')
+X_test   = np.concatenate([X_test_norm, X_test_anom])
+y_test   = np.array([0]*len(X_test_norm) + [1]*len(X_test_anom), dtype=np.int32)
 
 # 3-way split of normal train data: fit / calib / val-normal
-n_fit   = int(0.8 * len(X_normal))
-n_calib = int(0.1 * len(X_normal))
-X_fit      = X_normal[:n_fit]
-X_calib    = X_normal[n_fit:n_fit+n_calib]
-X_val_norm = X_normal[n_fit+n_calib:]
+n_fit   = int(0.8 * len(X_normal_all))
+n_calib = int(0.1 * len(X_normal_all))
+X_fit      = X_normal_all[:n_fit]
+X_calib    = X_normal_all[n_fit:n_fit+n_calib]
+X_val_norm = X_normal_all[n_fit+n_calib:]
 
+# Validation set = held-out normal slice + sample of the unused defective pool
 rng = np.random.default_rng(SEED)
-n_val_defect   = min(len(X_val_defect_pool), max(len(X_val_norm), 50))
+n_val_defect = min(len(X_val_defect_pool), max(len(X_val_norm), 50))
 val_defect_idx = rng.choice(len(X_val_defect_pool), n_val_defect, replace=False)
-X_val_defect   = X_val_defect_pool[val_defect_idx]
+X_val_defect = X_val_defect_pool[val_defect_idx]
 
 X_val = np.concatenate([X_val_norm, X_val_defect])
 y_val = np.array([0]*len(X_val_norm) + [1]*len(X_val_defect), dtype=np.int32)
 
+print(f'Normal train total: {len(X_normal_all)}')
 print(f'Fit: {len(X_fit)} | Calib: {len(X_calib)} | '
       f'Val: {len(X_val)} (normal={len(X_val_norm)} defect={len(X_val_defect)})')
+print(f'Test: {len(X_test)} (normal={len(X_test_norm)} anomal={len(X_test_anom)})')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. TRANSFORMS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def bscan_to_pil(arr):
-    """(256, 256) float32 [0,1] → PIL RGB (grayscale replicated to 3 channels)."""
-    return Image.fromarray((arr * 255).clip(0, 255).astype(np.uint8)).convert('RGB')
+def patch_to_pil(arr):
+    """(64,64) float32 [0,1] → PIL RGB."""
+    return Image.fromarray((arr * 255).clip(0,255).astype(np.uint8)).convert('RGB')
 
 tf_dino = T.Compose([
     T.Resize(224, interpolation=T.InterpolationMode.BILINEAR),
@@ -161,9 +137,9 @@ tf_dec = T.Compose([
 aug = T.Compose([
     T.RandomHorizontalFlip(),
     T.RandomVerticalFlip(),
-    T.RandomRotation(15),
+    T.RandomRotation(30),
     T.RandomResizedCrop(IMG_SZ, scale=(0.8, 1.0)),
-    T.ColorJitter(brightness=0.2, contrast=0.2),
+    T.ColorJitter(brightness=0.15, contrast=0.15),
 ])
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -235,7 +211,7 @@ def dino_patch_tokens(x):
     return dino(x).unsqueeze(1)
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 5. DINOv2-VAE  (decoder 4→8→16→32→64→128→256 for 256×256 output)
+# 5. DINOv2-VAE (decoder 4→8→16→32→64)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DINOv2VAE(nn.Module):
@@ -244,23 +220,18 @@ class DINOv2VAE(nn.Module):
         self.fc_mu      = nn.Linear(DINO_DIM, LATENT_DIM)
         self.fc_log_var = nn.Linear(DINO_DIM, LATENT_DIM)
         self.decoder = nn.Sequential(
-            nn.Linear(LATENT_DIM, 512),          nn.LeakyReLU(0.2),
-            nn.Linear(512, 512 * 4 * 4),         nn.LeakyReLU(0.2),
-            nn.Unflatten(1, (512, 4, 4)),
-            # 4 → 8 → 16 → 32 → 64 → 128 → 256
-            nn.ConvTranspose2d(512, 256, 4, stride=2, padding=1), nn.BatchNorm2d(256), nn.LeakyReLU(0.2),
+            nn.Linear(LATENT_DIM, 256),         nn.LeakyReLU(0.2),
+            nn.Linear(256, 256 * 4 * 4),        nn.LeakyReLU(0.2),
+            nn.Unflatten(1, (256, 4, 4)),
+            # 4 → 8 → 16 → 32 → 64
             nn.ConvTranspose2d(256, 128, 4, stride=2, padding=1), nn.BatchNorm2d(128), nn.LeakyReLU(0.2),
             nn.ConvTranspose2d(128,  64, 4, stride=2, padding=1), nn.BatchNorm2d(64),  nn.LeakyReLU(0.2),
             nn.ConvTranspose2d(64,   32, 4, stride=2, padding=1), nn.BatchNorm2d(32),  nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(32,   16, 4, stride=2, padding=1), nn.BatchNorm2d(16),  nn.LeakyReLU(0.2),
-            nn.ConvTranspose2d(16,    3, 4, stride=2, padding=1), nn.Tanh(),
+            nn.ConvTranspose2d(32,    3, 4, stride=2, padding=1), nn.Tanh(),
         )
 
     def encode_feat(self, feat):
         return self.fc_mu(feat), self.fc_log_var(feat).clamp(-10, 10)
-
-    def encode(self, x_dino):
-        return self.encode_feat(dino_features(x_dino).detach())
 
     def decode(self, z):
         return self.decoder(z)
@@ -279,11 +250,10 @@ print(f'Trainable params: {sum(p.numel() for p in model.parameters() if p.requir
 # ══════════════════════════════════════════════════════════════════════════════
 
 def cache_features(imgs, desc='cache'):
-    """Returns (N, DINO_DIM) float32 — DINOv2 run once per image."""
     all_feats = []
     for i in tqdm(range(0, len(imgs), 128), desc=f'  {desc}', leave=False):
         batch = imgs[i:i+128]
-        x = torch.stack([tf_dino(bscan_to_pil(p)) for p in batch]).to(DEVICE)
+        x = torch.stack([tf_dino(patch_to_pil(p)) for p in batch]).to(DEVICE)
         all_feats.append(dino_features(x).cpu())
     return torch.cat(all_feats)
 
@@ -306,7 +276,7 @@ class CachedFeatDS(Dataset):
     def __len__(self): return len(self.feats)
 
     def __getitem__(self, i):
-        img = aug(bscan_to_pil(self.imgs[i]))
+        img = aug(patch_to_pil(self.imgs[i]))
         return self.feats[i], tf_dec(img)
 
 
@@ -339,17 +309,15 @@ for epoch in range(1, VAE_EPOCHS + 1):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def compute_residuals(cached_feats, imgs):
-    """Returns (N,) p95 pixel residual per image using cached features."""
     model.eval()
     res = []
     with torch.no_grad():
         for i in tqdm(range(0, len(imgs), 128), desc='  residuals', leave=False):
             feat  = cached_feats[i:i+128].to(DEVICE)
-            x_t   = torch.stack([tf_dec(bscan_to_pil(p))
-                                  for p in imgs[i:i+128]]).to(DEVICE)
+            x_t   = torch.stack([tf_dec(patch_to_pil(p)) for p in imgs[i:i+128]]).to(DEVICE)
             mu, _ = model.encode_feat(feat)
             recon = model.decode(mu)
-            mae   = (x_t - recon).abs().mean(dim=1)   # (B, H, W)
+            mae   = (x_t - recon).abs().mean(dim=1)
             res.append(np.percentile(mae.cpu().numpy(), 95, axis=(1, 2)))
     r = np.concatenate(res)
     if np.isnan(r).any():
@@ -364,14 +332,14 @@ res_val   = compute_residuals(feat_val,   X_val)
 print(f'  Fit mean residual: {res_fit.mean():.4f}')
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 8. DINOv2 PATCH-TOKEN MEMORY BANK
+# 8. MEMORY BANK
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _all_patch_tokens(imgs, desc='tokens'):
     all_toks = []
     for i in tqdm(range(0, len(imgs), 64), desc=f'  {desc}', leave=False):
         batch = imgs[i:i+64]
-        x     = torch.stack([tf_dino(bscan_to_pil(p)) for p in batch]).to(DEVICE)
+        x     = torch.stack([tf_dino(patch_to_pil(p)) for p in batch]).to(DEVICE)
         toks  = dino_patch_tokens(x)
         toks  = F.normalize(toks.flatten(0, 1).float(), dim=1)
         all_toks.append(toks.cpu())
@@ -402,7 +370,7 @@ def knn_scores(imgs, desc='knn'):
     scores = []
     for i in tqdm(range(0, len(imgs), 32), desc=f'  {desc}', leave=False):
         batch = imgs[i:i+32]
-        x     = torch.stack([tf_dino(bscan_to_pil(p)) for p in batch]).to(DEVICE)
+        x     = torch.stack([tf_dino(patch_to_pil(p)) for p in batch]).to(DEVICE)
         toks  = dino_patch_tokens(x)
         toks  = F.normalize(toks.float(), dim=-1)
         B, N, D = toks.shape
@@ -425,31 +393,28 @@ bank_val   = knn_scores(X_val,   'val knn')
 
 print('\n── Step 8: NCS & Ensemble ──')
 
-ncs_vae_fit, ncs_vae_calib, ncs_vae_test, ncs_vae_val      = res_fit, res_calib, res_test, res_val
-ncs_bank_fit, ncs_bank_calib, ncs_bank_test, ncs_bank_val  = bank_fit, bank_calib, bank_test, bank_val
-
 def znorm(x, ref):
     return (x - ref.mean()) / (ref.std() + 1e-9)
 
-vae_fit_n   = znorm(ncs_vae_fit,   ncs_vae_fit)
-vae_calib_n = znorm(ncs_vae_calib, ncs_vae_fit)
-vae_test_n  = znorm(ncs_vae_test,  ncs_vae_fit)
-vae_val_n   = znorm(ncs_vae_val,   ncs_vae_fit)
+vae_fit_n   = znorm(res_fit,   res_fit)
+vae_calib_n = znorm(res_calib, res_fit)
+vae_test_n  = znorm(res_test,  res_fit)
+vae_val_n   = znorm(res_val,   res_fit)
 
-bank_fit_n   = znorm(ncs_bank_fit,   ncs_bank_fit)
-bank_calib_n = znorm(ncs_bank_calib, ncs_bank_fit)
-bank_test_n  = znorm(ncs_bank_test,  ncs_bank_fit)
-bank_val_n   = znorm(ncs_bank_val,   ncs_bank_fit)
+bank_fit_n   = znorm(bank_fit,   bank_fit)
+bank_calib_n = znorm(bank_calib, bank_fit)
+bank_test_n  = znorm(bank_test,  bank_fit)
+bank_val_n   = znorm(bank_val,   bank_fit)
 
 # w is swept on the VALIDATION set (held-out normal + previously-unused
-# defective training pool), NEVER on the test set -- test set is only
-# touched once, at final reporting, below.
+# defective pool), NEVER on the test set -- test set is only touched once,
+# at final reporting, below.
 print('  Sweeping ensemble weight (on validation set, not test) ...')
 best_auroc_ens, best_ew = 0.0, ENSEMBLE_W
 for ew in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]:
     ncs = (1 - ew) * vae_val_n + ew * bank_val_n
     a   = roc_auc_score(y_val, ncs)
-    print(f'    ew={ew:.1f} → val AUROC={a:.4f}')
+    print(f'    ew={ew:.1f} → AUROC={a:.4f}')
     if a > best_auroc_ens:
         best_auroc_ens, best_ew = a, ew
 
@@ -468,7 +433,9 @@ n_cal    = len(ncs_calib)
 p_values = np.array([(np.sum(ncs_calib >= s) + 1) / (n_cal + 1) for s in ncs_test])
 
 # alpha is swept on the VALIDATION set's p-values (computed against the SAME
-# calibration reference used for the real test set), NEVER on the test set.
+# calibration reference that will be used for the real test set), NEVER on
+# the test set itself. This exactly mirrors the deployment procedure, just
+# using validation points instead of test points to pick alpha.
 p_values_val = np.array([(np.sum(ncs_calib >= s) + 1) / (n_cal + 1) for s in ncs_val])
 
 best_f1_cad, best_alpha = 0.0, CAD_ALPHA
@@ -486,7 +453,7 @@ y_pred_cad = (p_values < best_alpha).astype(int)
 y_pred_002 = (p_values < 0.02).astype(int)
 
 # ── Save scores for post-hoc conformal experiments ───────────────────────────
-_save = Path(__file__).parent / 'results' / 'mlndt_valsplit.npz'
+_save = OUT_DIR / 'casting_valsplit.npz'
 np.savez(_save, ncs_calib=ncs_calib, ncs_test=ncs_test,
          p_values=p_values, y_test=y_test,
          n_cal=np.int64(n_cal), best_alpha=np.float64(best_alpha),
@@ -510,11 +477,11 @@ def metrics(y_true, y_pred, scores, name):
 
 print('\n── Step 10: Results ──')
 
-thr_q60    = np.percentile(res_fit,   60)
-bank_thr95 = np.percentile(bank_fit,  95)
+thr_q65    = np.percentile(res_fit,  65)
+bank_thr95 = np.percentile(bank_fit, 95)
 
-res_vae    = metrics(y_test, (res_test  > thr_q60).astype(int),
-                     res_test,   'DINOv2-VAE @ Q60 (thesis thr)')
+res_vae    = metrics(y_test, (res_test  > thr_q65).astype(int),
+                     res_test,   'DINOv2-VAE @ Q65 (thesis thr)')
 res_bank   = metrics(y_test, (bank_test > bank_thr95).astype(int),
                      bank_test,  'Memory Bank only (p95 thr)')
 res_cad002 = metrics(y_test, y_pred_002, ncs_test,
@@ -525,8 +492,8 @@ res_best   = metrics(y_test, y_pred_cad, ncs_test,
 print('\n' + '='*80)
 print(f'  {"Method":<42} {"F1":>6} {"Sens":>6} {"Spec":>6} {"AUROC":>7}')
 print('  ' + '-'*77)
-print(f'  {"Thesis reference (ML-NDT Q60)":<42} {"0.9159":>6} {"0.8596":>6} {"0.9767":>6} {"  N/A":>7}')
-print(f'  {"DINOv2-VAE @ Q60":<42}'
+print(f'  {"Thesis reference (CT-Casting Q65)":<42} {"0.7300":>6} {"0.7000":>6} {"0.7800":>6} {"  N/A":>7}')
+print(f'  {"DINOv2-VAE @ Q65":<42}'
       f' {res_vae["f1"]:>6.4f} {res_vae["sens"]:>6.4f} {res_vae["spec"]:>6.4f} {res_vae["auroc"]:>7.4f}')
 print(f'  {"Memory Bank only":<42}'
       f' {res_bank["f1"]:>6.4f} {res_bank["sens"]:>6.4f} {res_bank["spec"]:>6.4f} {res_bank["auroc"]:>7.4f}')
@@ -544,15 +511,15 @@ fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
 ax = axes[0]
 for scores, label, color, ls in [
-    (ncs_vae_test,  f'VAE p95 (AUROC={roc_auc_score(y_test, ncs_vae_test):.3f})',   'steelblue', '-'),
-    (ncs_bank_test, f'Mem. Bank (AUROC={roc_auc_score(y_test, ncs_bank_test):.3f})', 'orange',   '-'),
-    (ncs_test,      f'Ensemble (AUROC={best_auroc_ens:.3f})',                         'tomato',   '--'),
+    (vae_test_n,   f'VAE p95 (AUROC={roc_auc_score(y_test, vae_test_n):.3f})',    'steelblue', '-'),
+    (bank_test_n,  f'Mem. Bank (AUROC={roc_auc_score(y_test, bank_test_n):.3f})',  'orange',   '-'),
+    (ncs_test,     f'Ensemble (AUROC={best_auroc_ens:.3f})',                        'tomato',   '--'),
 ]:
     fpr, tpr, _ = roc_curve(y_test, scores)
     ax.plot(fpr, tpr, color=color, lw=2, linestyle=ls, label=label)
 ax.plot([0, 1], [0, 1], 'k--', lw=1)
 ax.set_xlabel('FPR'); ax.set_ylabel('TPR')
-ax.set_title('ROC — ML-NDT Ultrasonic Welds')
+ax.set_title('ROC — CT-Casting')
 ax.legend(fontsize=8)
 
 ax = axes[1]
@@ -564,23 +531,24 @@ ax.set_xlabel('p-value'); ax.set_title('CAD p-value distribution')
 ax.legend()
 
 ax = axes[2]
-methods = ['Thesis\n(ML-NDT)', 'DINOv2\nVAE', 'Memory\nBank', 'Ensemble\n+CAD']
-f1s    = [0.9159, res_vae['f1'],    res_bank['f1'],    res_best['f1']]
+methods = ['Thesis\n(CT-Cast)', 'DINOv2\nVAE', 'Memory\nBank', 'Ensemble\n+CAD']
+f1s    = [0.7300, res_vae['f1'],    res_bank['f1'],    res_best['f1']]
 aurocs = [np.nan, res_vae['auroc'], res_bank['auroc'], res_best['auroc']]
 x = np.arange(4); w = 0.3
 b1 = ax.bar(x - w/2, f1s, w, color='steelblue', label='F1')
 b2 = ax.bar([1+w/2, 2+w/2, 3+w/2], aurocs[1:], w, color='tomato', label='AUROC')
 for bar, v in list(zip(b1, f1s)) + list(zip(b2, aurocs[1:])):
-    ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f'{v:.3f}',
-            ha='center', va='bottom', fontsize=8)
+    if not np.isnan(v):
+        ax.text(bar.get_x() + bar.get_width() / 2, v + 0.01, f'{v:.3f}',
+                ha='center', va='bottom', fontsize=8)
 ax.set_xticks(x); ax.set_xticklabels(methods, fontsize=9)
 ax.set_ylim(0, 1.15); ax.set_title('Performance vs Thesis Baseline'); ax.legend()
 
 plt.tight_layout()
-out = Path(__file__).parent / 'results' / 'results_mlndt_dinov2_valsplit.png'
+out = OUT_DIR / 'results_casting_dinov2_valsplit.png'
 plt.savefig(out, dpi=150, bbox_inches='tight')
-print(f'\nPlot saved → {out}')
 plt.close(fig)
+print(f'\nPlot saved → {out}')
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 13. EXPLAINABILITY — t-SNE + Anomaly Heatmaps
@@ -590,23 +558,21 @@ from sklearn.manifold import TSNE
 import matplotlib.gridspec as gridspec
 from scipy.ndimage import zoom as nd_zoom
 
-print('\n── Step 12: Explainability (t-SNE + Heatmaps) ──')
+print('\n── Step 11: Explainability (t-SNE + Heatmaps) ──')
 
-PATCH_SIDE = 16   # 224 / 14 = 16 patches per side for ViT-S/14
+PATCH_SIDE = 16
 
-# ── t-SNE on DINOv2 features ────────────────────────────────────────────────
 print('  Running t-SNE...')
-n_tsne   = min(600, len(feat_test))
+n_tsne   = min(100, len(feat_test))
 rng      = np.random.default_rng(SEED)
 idx_vis  = rng.choice(len(feat_test), n_tsne, replace=False)
-f2d      = TSNE(n_components=2, perplexity=30, random_state=SEED,
+f2d      = TSNE(n_components=2, perplexity=15, random_state=SEED,
                 max_iter=1000, init='pca').fit_transform(feat_test[idx_vis].numpy())
 lbl_vis  = y_test[idx_vis]
 
-# ── Per-patch KNN heatmap ───────────────────────────────────────────────────
 @torch.no_grad()
 def patch_heatmap(img_arr):
-    x     = tf_dino(bscan_to_pil(img_arr)).unsqueeze(0).to(DEVICE)
+    x     = tf_dino(patch_to_pil(img_arr)).unsqueeze(0).to(DEVICE)
     toks  = dino_patch_tokens(x)
     toks  = F.normalize(toks.float(), dim=-1)
     flat  = toks.reshape(-1, toks.shape[-1])
@@ -621,16 +587,15 @@ print('  Computing heatmaps...')
 norm_hmaps = [patch_heatmap(X_test[i]) for i in norm_idx]
 anom_hmaps = [patch_heatmap(X_test[i]) for i in anom_idx]
 
-# ── Figure ──────────────────────────────────────────────────────────────────
 fig_e = plt.figure(figsize=(22, 14))
 gs    = gridspec.GridSpec(3, 4, figure=fig_e, hspace=0.45, wspace=0.3)
 
 ax_t = fig_e.add_subplot(gs[0, :])
 ax_t.scatter(f2d[lbl_vis == 0, 0], f2d[lbl_vis == 0, 1],
-             c='steelblue', alpha=0.5, s=12, label='Normal')
+             c='steelblue', alpha=0.6, s=30, label='Normal')
 ax_t.scatter(f2d[lbl_vis == 1, 0], f2d[lbl_vis == 1, 1],
-             c='tomato', alpha=0.7, s=15, label='Anomal', zorder=3)
-ax_t.set_title('t-SNE — DINOv2 Latent Space (ML-NDT Ultrasonic Welds)', fontsize=12)
+             c='tomato', alpha=0.8, s=30, label='Anomal', zorder=3)
+ax_t.set_title('t-SNE — DINOv2 Latent Space (CT-Casting)', fontsize=12)
 ax_t.set_xlabel('t-SNE 1'); ax_t.set_ylabel('t-SNE 2')
 ax_t.legend(fontsize=10)
 
@@ -652,8 +617,8 @@ for col, (idx, hmap) in enumerate(zip(anom_idx, anom_hmaps)):
 
 cb_ax = fig_e.add_axes([0.92, 0.07, 0.015, 0.45])
 plt.colorbar(im, cax=cb_ax, label='KNN distance (anomaly score)')
-fig_e.suptitle('DINOv2 Memory Bank Explainability — ML-NDT', fontsize=13, fontweight='bold')
-out_exp = Path(__file__).parent / 'results' / 'results_mlndt_dinov2_valsplit_explainability.png'
+fig_e.suptitle('DINOv2 Memory Bank Explainability — CT-Casting', fontsize=13, fontweight='bold')
+out_exp = OUT_DIR / 'results_casting_dinov2_valsplit_explainability.png'
 plt.savefig(out_exp, dpi=150, bbox_inches='tight')
 plt.close(fig_e)
 print(f'  Explainability plot → {out_exp}')

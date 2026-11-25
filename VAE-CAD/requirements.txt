@@ -1,0 +1,6 @@
+numpy>=1.26,<2.1
+scipy>=1.14,<2
+pandas>=2.2,<4
+scikit-learn>=1.5,<2
+h5py>=3.11,<4
+tensorflow>=2.18,<2.19
